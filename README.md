@@ -9,7 +9,7 @@
 [![Donate at PayPal](https://img.shields.io/badge/Donate-PayPal-2997d8)](https://www.paypal.com/donate?hosted_button_id=2BVFF5GJ9SXAJ)
 [![Sponsor at Github](https://img.shields.io/badge/Sponsor-GitHub-28a745)](https://github.com/sponsors/tillsteinbach)
 
-## THIS CONNECTOR WAS NOT YET TESTED WITH A REAL CAR! IF YOU LIKE PLEASE TEST IT AND GIVE FEEDBACK. ALSO IF YOU WOULD LIKE TO PROVIDE ME SOME USER ACCOUNT FOR TESTING CONTACT ME!
+## This connector is tested against a Dacia Spring. Currently two data points are not resolved properly: "charges" should give the charging history, and "ev/settings". Since in both cases the data is acquired but not resolved, the readout is throttled to occur at most every two hours.
 
 [CarConnectivity](https://github.com/tillsteinbach/CarConnectivity) is a python API to connect to various car services. This connector enables the integration of Renault and Dacia vehicles through the Renault/Kamereon API. Look at [CarConnectivity](https://github.com/tillsteinbach/CarConnectivity) for other supported brands.
 
