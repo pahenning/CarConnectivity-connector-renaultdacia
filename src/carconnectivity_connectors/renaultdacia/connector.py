@@ -18,13 +18,13 @@ from carconnectivity.errors import AuthenticationError, TooManyRequestsError, Re
 from carconnectivity.util import robust_time_parse, log_extra_keys, config_remove_credentials
 from carconnectivity.units import Length, Volume
 from carconnectivity.drive import ElectricDrive, CombustionDrive
-# pah from carconnectivity.attributes import DurationAttribute, EnumAttribute
 from carconnectivity.attributes import DurationAttribute, EnumAttribute, StringAttribute
 from carconnectivity.units import Temperature
 from carconnectivity.charging import Charging
 from carconnectivity.charging_connector import ChargingConnector
 from carconnectivity.enums import ConnectionState
 from carconnectivity.climatization import Climatization
+from carconnectivity.commands import GenericCommand
 
 from carconnectivity_connectors.base.connector import BaseConnector
 from carconnectivity_connectors.renaultdacia.auth.gigya_session import GigyaSession
@@ -117,13 +117,30 @@ KAMEREON_VEHICLES_URL = "{kamereon_root_url}/commerce/v1/accounts/{account_id}/v
 KAMEREON_VEHICLE_DATA_URL = (
     "{kamereon_root_url}/commerce/v1/accounts/{account_id}/kamereon/kca/car-adapter/v{version}/cars/{vin}/{endpoint}"
 )
-# pah: KCM endpoints, e.g. EV SOC target
+#KCM endpoints, e.g. EV SOC target
 KAMEREON_KCM_VEHICLE_DATA_URL = (
     "{kamereon_root_url}/commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/{endpoint}"
 )
+#ACTION endpoints
 KAMEREON_VEHICLE_ACTION_URL = (
     "{kamereon_root_url}/commerce/v1/accounts/{account_id}/kamereon/kca/car-adapter/v{version}/cars/{vin}/{endpoint}"
 )
+        
+def _local_time_string(value: str) -> str:
+    """
+    Convert an ISO-8601 timestamp to local system time.
+
+    Example:
+    2026-09-17T17:03:53Z -> 2026-09-17 19:03:53
+    """
+    if not value:
+        return value
+
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return value
 
 
 # pylint: disable=too-many-lines
@@ -240,7 +257,7 @@ class Connector(BaseConnector):
 
         self._elapsed: List[timedelta] = []
 
-        # pah: account preference / fallback.
+        # account preference / fallback.
         # Renault returns several logical accounts for one person.  For the
         # observed Dacia account the person-owned SFDC account provides the
         # vehicle data and MYDACIA can be used as a fallback.  Keeping both
@@ -248,10 +265,6 @@ class Connector(BaseConnector):
         # successful request twice.
         self._preferred_account_id = None
         self._fallback_account_id = None
-
-        # pah: experimental endpoints must not be queried every poll cycle.
-        # Key: "<vin>:<endpoint>", value: timestamp of last attempt.
-        self._experimental_last_attempt = {}
 
     def startup(self) -> None:
         """Start the background polling thread."""
@@ -308,11 +321,10 @@ class Connector(BaseConnector):
             self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
             raise RetrievalError(f'Failed to retrieve person data: {err}') from err
 
-        # pah:
         # Renault returns several ACTIVE/OWNER accounts for the same person.
         #
         # Preferred:
-        #   SFDC       -> person-owned account (Rebecca Kuspiel in observed data)
+        #   SFDC       -> person-owned account 
         # Fallback:
         #   MYDACIA    -> only when SFDC cannot supply the required information
         #
@@ -553,7 +565,7 @@ class Connector(BaseConnector):
         """
         Read a known-good KCA vehicle endpoint.
 
-        pah: Do not duplicate successful requests.  The preferred SFDC account is
+        Do not duplicate successful requests.  The preferred SFDC account is
         tried first; MYDACIA is queried only if the preferred account cannot
         deliver this endpoint.
         """
@@ -617,16 +629,71 @@ class Connector(BaseConnector):
             setattr(parent, name, attribute)
         attribute._set_value(value=value)  # pylint: disable=protected-access
 
-    def _experimental_due(self, vin: str, endpoint: str, minimum_age: timedelta) -> bool:
-        """Throttle endpoints that are still experimental or incompletely understood."""
-        key = f"{vin}:{endpoint}"
-        now = datetime.now(tz=timezone.utc)
-        last_attempt = self._experimental_last_attempt.get(key)
-        if last_attempt is not None and now - last_attempt < minimum_age:
-            return False
-        self._experimental_last_attempt[key] = now
-        return True
+    def _kamereon_post_vehicle_action(
+        self,
+        account_id: str,
+        vin: str,
+        endpoint: str,
+        payload: dict,
+        version: int = 1
+    ):
+        """
+        Execute a KCA vehicle action.
+    
+        Do not duplicate successful requests. The preferred SFDC account is
+        tried first; MYDACIA is queried only if the preferred account cannot
+        execute this endpoint.
+        """
+        candidates = self._vehicle_account_candidates(account_id)
+        last_error = None
 
+        for index, candidate in enumerate(candidates):
+            url = self._get_vehicle_data_url(
+                candidate,
+                vin,
+                endpoint,
+                version=version
+            )
+
+            try:
+                return self.session.kamereon_post(
+                    url,
+                    json_data=payload
+                ), candidate
+
+            except requests.exceptions.HTTPError as err:
+                last_error = err
+                status = (
+                    err.response.status_code
+                    if err.response is not None
+                    else None
+                )
+
+                # Do not multiply quota requests.
+                if status == 429:
+                    raise
+
+                has_fallback = index + 1 < len(candidates)
+
+                if (
+                    has_fallback
+                    and status in (403, 404, 500, 502, 503, 504)
+                ):
+                    LOG_API.debug(
+                        "%s action unavailable for %s via preferred "
+                        "account (HTTP %s); trying MYDACIA fallback",
+                        endpoint,
+                        vin,
+                        status,
+                    )
+                    continue
+    
+                raise
+    
+        if last_error is not None:
+            raise last_error
+    
+        return None, None
 
     def _fetch_vehicle(self, garage: Garage, account_id: str, vin: str, vehicle_details: Dict) -> None:  # pylint: disable=too-many-branches,too-many-statements
         """Fetch and populate data for a single vehicle."""
@@ -638,7 +705,7 @@ class Connector(BaseConnector):
 
         vehicle: Optional[RenaultVehicle] = None
 
-        # pah: Reuse an already matching Renault vehicle. If another connector
+        # Reuse an already matching Renault vehicle. If another connector
         # already created the VIN with a different/generic vehicle class, wrap
         # that object via origin= and replace it in the garage. This preserves
         # existing data while creating Renault-specific climatization/charging.
@@ -722,6 +789,51 @@ class Connector(BaseConnector):
         if isinstance(vehicle, (RenaultElectricVehicle, RenaultHybridVehicle)):
             self._fetch_battery_status(account_id, vin, vehicle)
 
+        # expose Renault RefreshLocation as a real CarConnectivity command.
+        if (
+                vehicle.commands is not None
+                and not vehicle.commands.contains_command('refresh-location')
+        ):
+            refresh_location_command = GenericCommand(
+                name='refresh-location',
+                parent=vehicle.commands
+            )
+            refresh_location_command._add_on_set_hook(
+                self._on_refresh_location
+            )  # pylint: disable=protected-access
+            refresh_location_command.enabled = True
+            vehicle.commands.add_command(refresh_location_command)
+            
+        #expose Renault charge history request as CarConnectivity command
+        if (
+                 vehicle.commands is not None
+                and not vehicle.commands.contains_command('get-chargehistory')
+        ):
+            chargehistory_command = GenericCommand(
+                name='get-chargehistory',
+                parent=vehicle.commands
+            )
+            chargehistory_command._add_on_set_hook(
+                self._on_get_chargehistory
+            )  # pylint: disable=protected-access
+            chargehistory_command.enabled = True
+            vehicle.commands.add_command(chargehistory_command)
+            
+        # expose Renault HVAC control as CarConnectivity command
+        if (
+                vehicle.commands is not None
+                and not vehicle.commands.contains_command('climatization')
+        ):
+            climatization_command = GenericCommand(
+                name='climatization',
+                parent=vehicle.commands
+            )
+            climatization_command._add_on_set_hook(
+                self._on_climatization
+            )  # pylint: disable=protected-access
+            climatization_command.enabled = True
+            vehicle.commands.add_command(climatization_command)
+
         self._fetch_hvac_status(account_id, vin, vehicle)
         self._fetch_location(account_id, vin, vehicle)
 
@@ -739,13 +851,9 @@ class Connector(BaseConnector):
         # Keeping this list here documents the tests without burning API quota.
         # ------------------------------------------------------------------
 
-        # Still unresolved / experimental:
-        # - KCA charges: endpoint exists, but current parameterization returns
-        #   HTTP 400 conversionFailed.
-        # - KCM ev/settings: endpoint support is unresolved; tests reached HTTP
-        #   429 quota limit rather than 403/404.
         if isinstance(vehicle, (RenaultElectricVehicle, RenaultHybridVehicle)):
-            self._fetch_experimental_ev_data(account_id, vin, vehicle)
+            #confirmed working KCM EV settings endpoint
+            self._fetch_ev_settings(account_id, vin, vehicle)
 
     def _get_vehicle_data_url(self, account_id: str, vin: str, endpoint: str, version: int = 1) -> str:
         """Build URL for a Kamereon vehicle data endpoint."""
@@ -757,118 +865,170 @@ class Connector(BaseConnector):
             endpoint=endpoint,
         )
         
-
-    # pah: temporary Renault endpoint probe
-
-    def _fetch_experimental_ev_data(
+    #-- fetch ev/settings
+    def _fetch_ev_settings(
             self,
             account_id: str,
             vin: str,
             vehicle: RenaultElectricVehicle
     ) -> None:
-        """
-        Probe only endpoints whose support is still unresolved.
-
-        These requests are deliberately throttled and use only the already
-        selected account.  They do not fall back to MYDACIA, because duplicate
-        tests previously produced the same result and unnecessarily consumed
-        the Renault quota.
-        """
-
-        # KCA charges -------------------------------------------------------
-        # The endpoint exists, but our parameter format still returns:
-        # HTTP 400 err.func.wired.conversionFailed.
-        # Keep one attempt per 24 h until the correct parameter format is known.
-        if self._experimental_due(vin, 'charges', timedelta(hours=2)):
-            now = datetime.now(timezone.utc)
-            start_date = now - timedelta(days=30)
-            start_str = start_date.strftime('%Y-%m-%dT00:00:00Z')
-            end_str = now.strftime('%Y-%m-%dT23:59:59Z')
-
-            url = self._get_vehicle_data_url(account_id, vin, 'charges', version=1)
-            url += f"?start={start_str}&end={end_str}"
-
-            try:
-                data = self.session.kamereon_get(url)
-                LOG_API.debug("Experimental charges data for %s: %s", vin, json.dumps(data, indent=2))
-                self._map_charges_data(vehicle, data)
-            except requests.exceptions.HTTPError as err:
-                status = err.response.status_code if err.response is not None else None
-                response_text = err.response.text if err.response is not None else ""
-                LOG_API.debug(
-                    "Experimental endpoint charges for %s remains unresolved "
-                    "(current parameterization; HTTP %s): %s",
-                    vin,
-                    status,
-                    response_text,
-                )
-            except Exception as err:  # pylint: disable=broad-except
-                LOG_API.debug("Experimental endpoint charges failed for %s: %s", vin, err)
-
-        # KCM ev/settings ---------------------------------------------------
-        # This endpoint has NOT been disproved by 403/404.  During testing the
-        # server answered HTTP 429 quota exceeded, so support remains unresolved.
-        # Keep one attempt per 6 h.
-        if self._experimental_due(vin, 'ev/settings', timedelta(hours=2)):
-            url = KAMEREON_KCM_VEHICLE_DATA_URL.format(
-                kamereon_root_url=self.session.kamereon_root_url,
-                account_id=account_id,
-                vin=vin,
-                endpoint='ev/settings'
+        """Fetch Renault/Dacia EV charging settings."""
+        url = KAMEREON_KCM_VEHICLE_DATA_URL.format(
+            kamereon_root_url=self.session.kamereon_root_url,
+            account_id=account_id,
+            vin=vin,
+            endpoint='ev/settings'
+        )
+        try:
+            data = self.session.kamereon_get(url)
+            LOG_API.debug(
+                "EV settings data for %s: %s",
+                vin,
+                json.dumps(data, indent=2)
             )
 
-            try:
-                data = self.session.kamereon_get(url)
-                LOG_API.debug("Experimental ev/settings data for %s: %s", vin, json.dumps(data, indent=2))
-                self._map_ev_settings(vehicle, data)
-            except requests.exceptions.HTTPError as err:
-                status = err.response.status_code if err.response is not None else None
-                response_text = err.response.text if err.response is not None else ""
-                LOG_API.debug(
-                    "Experimental endpoint ev/settings for %s remains unresolved "
-                    "(HTTP %s): %s",
-                    vin,
-                    status,
-                    response_text,
-                )
-            except Exception as err:  # pylint: disable=broad-except
-                LOG_API.debug("Experimental endpoint ev/settings failed for %s: %s", vin, err)
+            self._map_ev_settings(vehicle, data)
+        except requests.exceptions.HTTPError as err:
+            status = (
+                err.response.status_code
+                if err.response is not None
+                else None
+            )
+            LOG.warning(
+                "Could not fetch EV settings for %s (HTTP %s)",
+                vin,
+                status
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            LOG.warning(
+                "Could not fetch EV settings for %s: %s",
+                vin,
+                err
+            )
+            
+    #-- fetch charges
+    def _fetch_charges(
+            self,
+            account_id: str,
+            vin: str,
+            vehicle: RenaultElectricVehicle,
+            days: int = 30
+    ) -> None:
+        """Fetch Renault/Dacia charging sessions for the requested period."""
+        now = datetime.now(timezone.utc)
+        start_date = now - timedelta(days=days)
+        # Renault API expects YYYYMMDD for charges.
+        start_str = start_date.strftime('%Y%m%d')
+        end_str = now.strftime('%Y%m%d')
+        url = self._get_vehicle_data_url(
+            account_id,
+            vin,
+            'charges',
+            version=1
+        )
+        url += f"?start={start_str}&end={end_str}"
+        try:
+            data = self.session.kamereon_get(url)
+            LOG_API.debug(
+                "Charge history for %s (%s - %s): %s",
+                vin,
+                start_str,
+                end_str,
+                json.dumps(data, indent=2)
+            )
+            self._map_charges_data(vehicle, data)
+        except requests.exceptions.HTTPError as err:
+            status = (
+                err.response.status_code
+                if err.response is not None
+                else None
+            )
+            LOG.warning(
+                "Could not fetch charge history for %s "
+                "(HTTP %s)",
+                vin,
+                status
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            LOG.warning(
+                "Could not fetch charge history for %s: %s",
+                vin,
+                err
+            )
 
-    def _map_charges_data(self, vehicle: RenaultElectricVehicle, data) -> None:
-        """Expose the latest charge session if the experimental charges endpoint starts working."""
+    #-- map charges
+    def _map_charges_data(
+            self,
+            vehicle: RenaultElectricVehicle,
+            data
+    ) -> None:
+        """
+        Expose Renault/Dacia charge history as one multiline table.
+
+        One StringAttribute only, so MQTT/FHEM receives one
+        charge_history reading instead of separate readings
+        for every charge entry.
+        """
         if not isinstance(data, dict) or vehicle.charging is None:
             return
-
         payload = data.get('data', data)
         if isinstance(payload, dict):
             attributes = payload.get('attributes', payload)
         else:
             attributes = {}
-
-        charges = attributes.get('charges') if isinstance(attributes, dict) else None
-        if not isinstance(charges, list) or not charges:
+        charges = (
+            attributes.get('charges')
+            if isinstance(attributes, dict)
+            else None
+        )
+        if not isinstance(charges, list):
             return
-
-        latest = charges[-1]
-        if not isinstance(latest, dict):
-            return
-
-        mapping = {
-            'chargeStartDate': 'last_charge_start',
-            'chargeEndDate': 'last_charge_end',
-            'chargeDuration': 'last_charge_duration_raw',
-            'chargeStartBatteryLevel': 'last_charge_start_level',
-            'chargeEndBatteryLevel': 'last_charge_end_level',
-            'chargeBatteryLevelRecovered': 'last_charge_level_recovered',
-            'chargePower': 'last_charge_power_type',
-            'chargeStartInstantaneousPower': 'last_charge_start_power',
-            'chargeEndStatus': 'last_charge_end_status',
-        }
-        for source_name, target_name in mapping.items():
-            self._set_custom_string(vehicle.charging, target_name, latest.get(source_name))
-
+        # Keep Renault entries unchanged, but present them chronologically.
+        charges = sorted(
+            (charge for charge in charges if isinstance(charge, dict)),
+            key=lambda charge: charge.get('chargeStartDate', '')
+        )
+        lines = [
+            "count start end status soc_start soc_end energy duration"
+        ]
+        for count, charge in enumerate(charges, start=1):
+            start = _local_time_string(
+                charge.get('chargeStartDate')
+            )
+            end = _local_time_string(
+                charge.get('chargeEndDate')
+            )
+            status = charge.get('chargeEndStatus', '')
+            soc_start = charge.get('chargeStartBatteryLevel', '')
+            soc_end = charge.get('chargeEndBatteryLevel', '')
+            energy = charge.get('chargeEnergyRecovered')
+            if energy is None:
+                energy_str = ''
+            else:
+                try:
+                    energy_str = f"{float(energy):.2f}"
+                except (TypeError, ValueError):
+                    energy_str = str(energy)
+            duration = charge.get('chargeDuration', '')
+            lines.append(
+                f"{count} "
+                f"{start} "
+                f"{end} "
+                f"{status} "
+                f"{soc_start} "
+                f"{soc_end} "
+                f"{energy_str} "
+                f"{duration}"
+            )
+        self._set_custom_string(
+            vehicle.charging,
+            'charge_history',
+            '\n'.join(lines)
+        )
+            
+    #-- map ev/settings
     def _map_ev_settings(self, vehicle: RenaultElectricVehicle, data) -> None:
-        """Expose KCM EV settings if the currently unresolved endpoint becomes available."""
+        """Map Renault/Dacia KCM EV settings to CarConnectivity attributes."""
         if not isinstance(data, dict):
             return
 
@@ -908,7 +1068,7 @@ class Connector(BaseConnector):
                     json.dumps(attributes.get('programs'), separators=(',', ':'))
                 )
 
-
+    #-- fetch cockpit data
     def _fetch_cockpit(self, account_id: str, vin: str, vehicle: RenaultVehicle) -> None:  # pylint: disable=too-many-branches
         """Fetch cockpit data (odometer, fuel level) for a vehicle."""
         try:
@@ -961,7 +1121,7 @@ class Connector(BaseConnector):
         log_extra_keys(LOG, 'cockpit.attributes', attributes,
                        {'totalMileage', 'fuelAutonomy', 'fuelQuantity', 'totalMileageUnit'})
 
-
+    #-- fetch battery status
     def _fetch_battery_status(self, account_id: str, vin: str, vehicle: RenaultElectricVehicle) -> None:
         # pylint: disable=too-many-branches,too-many-statements,too-many-locals
         """Fetch battery/charging status for an electric/hybrid vehicle."""
@@ -1029,7 +1189,7 @@ class Connector(BaseConnector):
 
             # Additional Spring fields that were actually observed.
             if drive.battery is not None:
-                self._set_custom_string(drive.battery, 'last_update', battery_timestamp)
+                self._set_custom_string(drive.battery, 'last_update', _local_time_string(battery_timestamp))
                 self._set_custom_string(drive.battery, 'v2l_system_status', v2l_status)
 
         charging_status = attributes.get('chargingStatus')
@@ -1117,7 +1277,7 @@ class Connector(BaseConnector):
                     remaining_td = timedelta(minutes=int(float(time_val)))
                     self._set_custom_duration(charging, 'remaining_time', remaining_td)
                     if charging.estimated_date_reached is not None:
-                        estimated_completion = datetime.now(tz=timezone.utc) + remaining_td
+                        estimated_completion = (datetime.now(tz=timezone.utc) + remaining_td).astimezone()
                         charging.estimated_date_reached._set_value(
                             value=estimated_completion
                         )  # pylint: disable=protected-access
@@ -1127,7 +1287,7 @@ class Connector(BaseConnector):
             self._set_custom_string(
                 charging,
                 'remaining_time_last_update',
-                remaining_time_last_update
+                _local_time_string(remaining_time_last_update)
             )
 
             if charging_instantaneous_power is not None and charging.power is not None:
@@ -1156,7 +1316,7 @@ class Connector(BaseConnector):
             'timestamp', 'chargeEnergy', 'chargePower',
         })
 
-
+    #-- fetch HVAC status
     def _fetch_hvac_status(self, account_id: str, vin: str, vehicle: RenaultVehicle) -> None:
         """Fetch HVAC status for a vehicle."""
         try:
@@ -1178,17 +1338,14 @@ class Connector(BaseConnector):
         except Exception as err:  # pylint: disable=broad-except
             LOG.warning("Failed to fetch HVAC status for %s: %s", vin, err)
             return
-
         attributes = data.get('data', {}).get('attributes', {})
         if not attributes:
             return
-
         hvac_status_str = attributes.get('hvacStatus')
         external_temp = attributes.get('externalTemperature')
         soc_threshold = attributes.get('socThreshold')
         last_update = attributes.get('lastUpdateTime')
         next_hvac_start = attributes.get('nextHvacStartDate')
-
         if hvac_status_str and isinstance(vehicle.climatization, RenaultClimatization):
             try:
                 renault_hvac_state = RenaultClimatization.RenaultClimatizationState(hvac_status_str)
@@ -1209,25 +1366,22 @@ class Connector(BaseConnector):
                     )  # pylint: disable=protected-access
             except ValueError:
                 LOG_API.debug("Unknown HVAC state for %s: %s", vin, hvac_status_str)
-
         if external_temp is not None and vehicle.outside_temperature is not None:
             vehicle.outside_temperature._set_value(
                 value=float(external_temp),
                 unit=Temperature.C
             )  # pylint: disable=protected-access
-
         # Spring response fields exposed as explicit MQTT topics.
         if vehicle.climatization is not None:
             self._set_custom_string(vehicle.climatization, 'soc_threshold', soc_threshold)
-            self._set_custom_string(vehicle.climatization, 'last_update', last_update)
-            self._set_custom_string(vehicle.climatization, 'next_hvac_start', next_hvac_start)
-
+            self._set_custom_string(vehicle.climatization, 'last_update', _local_time_string(last_update))
+            self._set_custom_string(vehicle.climatization, 'next_hvac_start', _local_time_string(next_hvac_start))
         log_extra_keys(LOG, 'hvac-status.attributes', attributes, {
             'hvacStatus', 'externalTemperature', 'socThreshold',
             'lastUpdateTime', 'nextHvacStartDate',
         })
 
-
+    #-- fetch location
     def _fetch_location(self, account_id: str, vin: str, vehicle: RenaultVehicle) -> None:
         """Fetch location data for a vehicle."""
         try:
@@ -1249,15 +1403,12 @@ class Connector(BaseConnector):
         except Exception as err:  # pylint: disable=broad-except
             LOG.warning("Failed to fetch location data for %s: %s", vin, err)
             return
-
         attributes = data.get('data', {}).get('attributes', {})
         if not attributes:
             return
-
         latitude = attributes.get('gpsLatitude')
         longitude = attributes.get('gpsLongitude')
         last_updated_str = attributes.get('lastUpdateTime')
-
         if latitude is not None and longitude is not None and vehicle.position is not None:
             last_updated_ts = None
             if last_updated_str:
@@ -1265,25 +1416,230 @@ class Connector(BaseConnector):
                     last_updated_ts = robust_time_parse(last_updated_str)
                 except ValueError as err:
                     LOG_API.debug("Could not parse location timestamp for %s: %s", vin, err)
-
             if vehicle.position.latitude is not None:
                 vehicle.position.latitude._set_value(
                     value=float(latitude),
                     measured=last_updated_ts
                 )  # pylint: disable=protected-access
-
             if vehicle.position.longitude is not None:
                 vehicle.position.longitude._set_value(
                     value=float(longitude),
                     measured=last_updated_ts
                 )  # pylint: disable=protected-access
-
-            self._set_custom_string(vehicle.position, 'last_update', last_updated_str)
-
+            self._set_custom_string(vehicle.position, 'last_update', _local_time_string(last_updated_str))
         log_extra_keys(LOG, 'location.attributes', attributes, {
             'gpsLatitude', 'gpsLongitude', 'lastUpdateTime',
         })
+    
+    #-- Hook get-chargehistory
+    def _on_get_chargehistory(self, command, command_arguments):
+        """Fetch Renault/Dacia charge history on explicit request."""
+        if command.parent is None or command.parent.parent is None:
+            raise ValueError("Charge history command has no vehicle")
+        vehicle = command.parent.parent
+        if vehicle.vin is None or vehicle.vin.value is None:
+            raise ValueError("Charge history command has no VIN")
+        if not isinstance(vehicle, RenaultElectricVehicle):
+            raise ValueError(
+                "Charge history is only available for electric vehicles"
+            )
+        vin = vehicle.vin.value
+        account_id = self._preferred_account_id
+        if account_id is None:
+            raise ValueError("No Renault/Dacia account available")
+        LOG.info(
+            "Requesting charge history for %s",
+            vin
+        )
+        self._fetch_charges(
+            account_id=account_id,
+            vin=vin,
+            vehicle=vehicle,
+            days=30
+        )
+        return command_arguments
+        
+    #-- Hook refresh_location
+    def _on_refresh_location(self, command, command_arguments):
+        """Execute the Renault/Dacia RefreshLocation CarConnectivity command."""
+        if command.parent is None or command.parent.parent is None:
+            raise ValueError("RefreshLocation command has no vehicle")
 
+        vehicle = command.parent.parent
+        if vehicle.vin is None or vehicle.vin.value is None:
+            raise ValueError("RefreshLocation command has no VIN")
+
+        vin = vehicle.vin.value
+        account_id = self._preferred_account_id
+        if account_id is None:
+            raise ValueError("No Renault/Dacia account available")
+
+        LOG.info("Requesting location refresh for %s", vin)
+        data = self._refresh_location(account_id=account_id, vin=vin)
+        LOG.debug("RefreshLocation accepted for %s: %s", vin, data)
+        return command_arguments
+
+    def _refresh_location(self, account_id: str, vin: str):
+        payload = {
+            "data": {
+                "type": "RefreshLocation"
+                }
+            }
+
+        data, used_account_id = self._kamereon_post_vehicle_action(
+            account_id=account_id,
+            vin=vin,
+            endpoint="actions/refresh-location",
+            payload=payload,
+            version=1,
+        )
+
+        LOG_API.warning(
+            "Refresh location for %s via account %s: %s",
+            vin,
+            used_account_id,
+            data,
+        )
+
+        return data
+
+    #---- Hook for climatization
+    def _on_climatization(self, command, command_arguments):
+        """
+        Execute Renault/Dacia climatization command.
+
+        MQTT payload:
+            start     -> start climatization at 21 degrees C
+            18..24    -> start climatization at specified temperature
+            stop      -> cancel active climatization
+        """
+        if command.parent is None or command.parent.parent is None:
+            raise ValueError("Climatization command has no vehicle")
+        vehicle = command.parent.parent
+        if vehicle.vin is None or vehicle.vin.value is None:
+            raise ValueError("Climatization command has no VIN")
+        vin = vehicle.vin.value
+        account_id = self._preferred_account_id
+        if account_id is None:
+            raise ValueError("No Renault/Dacia account available")
+        # GenericCommand normally supplies the MQTT payload directly.
+        # Be tolerant if a dict is supplied by another plugin/version.
+        value = command_arguments
+        if isinstance(value, dict):
+            if 'value' in value:
+                value = value['value']
+            elif 'command' in value:
+                value = value['command']
+        value = str(value).strip().lower()
+        # Default start temperature
+        if value == 'start':
+            action = 'start'
+            temperature = 21.0
+        # Cancel running preconditioning
+        elif value == 'stop':
+            action = 'cancel'
+            temperature = None
+        # Numerical value means start at this temperature
+        else:
+            try:
+                temperature = float(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported climatization command '{value}'. "
+                    "Use 'start', 'stop' or a temperature from 18 to 24."
+                ) from exc
+            if not 18.0 <= temperature <= 24.0:
+                raise ValueError(
+                    f"Climatization temperature {temperature} is out of range. "
+                    "Allowed range is 18 to 24 degrees C."
+                )
+            action = 'start'
+        LOG.info(
+            "Requesting climatization %s for %s%s",
+            action,
+            vin,
+            (
+                f" at {temperature:.1f} C"
+                if temperature is not None
+                else ""
+            )
+        )
+        data = self._set_climatization(
+            account_id=account_id,
+            vin=vin,
+            action=action,
+            temperature=temperature
+        )
+        LOG.debug(
+            "Climatization command '%s' accepted for %s: %s",
+            value,
+            vin,
+            data
+        )
+        return command_arguments
+    
+    #-- API function for climatization
+    def _set_climatization(
+           self,
+            account_id: str,
+            vin: str,
+            action: str,
+            temperature: float = None
+    ):
+        """
+        Start or cancel Renault/Dacia preconditioning.
+
+        start + temperature -> start climatization
+        cancel              -> cancel active climatization
+        """
+        if action == 'start':
+            if temperature is None:
+                temperature = 21.0
+
+            payload = {
+                "data": {
+                    "type": "HvacStart",
+                    "attributes": {
+                        "action": "start",
+                        "targetTemperature": float(temperature)
+                    }
+                }
+            }
+        elif action == 'cancel':
+            payload = {
+                "data": {
+                    "type": "HvacStart",
+                    "attributes": {
+                        "action": "cancel"
+                    }
+                }
+            }
+        else:
+            raise ValueError(
+                f"Unsupported Renault climatization action '{action}'"
+            )
+        data, used_account_id = self._kamereon_post_vehicle_action(
+            account_id=account_id,
+            vin=vin,
+            endpoint="actions/hvac-start",
+            payload=payload,
+            version=1,
+        )
+        LOG_API.warning(
+            "Climatization action %s for %s via account %s%s: %s",
+            action,
+            vin,
+            used_account_id,
+            (
+                f", target {temperature:.1f} C"
+                if temperature is not None
+                else ""
+            ),
+            data,
+        )
+        return data
+
+    #-- Shutdown the connector
     def shutdown(self) -> None:
         """Shut down the connector gracefully."""
         self._stop_event.set()
